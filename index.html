@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Music UI Render</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+  <div class="app">
+    <!-- Sidebar Controls -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h1>Music UI Render</h1>
+        <p class="subtitle">Create &amp; export music popup overlays</p>
+      </div>
+
+      <div class="controls">
+        <!-- Spotify Link Autofill -->
+        <div class="field">
+          <label>Spotify Link <span class="badge">Autofill</span></label>
+          <input type="text" id="spotifyInput" placeholder="Paste Spotify track URL...">
+          <p class="hint">Fills Title, Artist & Album Art</p>
+        </div>
+
+        <!-- Album Art Upload -->
+        <div class="field">
+          <label>Album Art</label>
+          <div class="art-row">
+            <div class="upload-zone" id="uploadZone">
+              <input type="file" id="artUpload" accept="image/*" hidden>
+              <div class="upload-placeholder" id="uploadPlaceholder">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+                  stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="3" width="18" height="18" rx="3" />
+                  <circle cx="8.5" cy="8.5" r="1.5" />
+                  <path d="M21 15l-5-5L5 21" />
+                </svg>
+                <span>Click or drag image</span>
+              </div>
+              <img id="uploadPreview" class="upload-preview" hidden>
+            </div>
+
+            <!-- Album Art Zoom & Crop -->
+            <div class="zoom-controls">
+              <button type="button" class="zoom-btn" id="zoomInBtn" title="Zoom in">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="11" cy="11" r="7" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                  <line x1="11" y1="8" x2="11" y2="14" />
+                  <line x1="8" y1="11" x2="14" y2="11" />
+                </svg>
+              </button>
+              <span class="zoom-level" id="zoomLevel">100%</span>
+              <button type="button" class="zoom-btn" id="zoomOutBtn" title="Zoom out">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="11" cy="11" r="7" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                  <line x1="8" y1="11" x2="14" y2="11" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Title -->
+        <div class="field">
+          <label>Title</label>
+          <input type="text" id="titleInput" placeholder="Title">
+        </div>
+
+        <!-- Album -->
+        <div class="field">
+          <label>Album</label>
+          <input type="text" id="albumInput" placeholder="Album Title">
+        </div>
+        
+        <!-- Artist + Duration Row -->
+        <div class="field-row">
+          <div class="field" style="flex:1">
+            <label>Artist</label>
+            <input type="text" id="artistInput" placeholder="Artist">
+          </div>
+          <div class="field" style="width:80px">
+            <label>Duration</label>
+            <input type="text" id="durationInput" placeholder="x:xx">
+          </div>
+        </div>
+
+        <hr class="divider">
+
+        <!-- Custom Intro Animation Toggle -->
+        <div class="toggle-field">
+          <div>
+            <label>Custom Intro Animation</label>
+            <p class="hint">Stroke trim + content fade-in</p>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="animToggle">
+            <span class="toggle-track"></span>
+          </label>
+        </div>
+
+        <!-- Extra Styling Toggle -->
+        <div class="toggle-field">
+          <div>
+            <label>Extra Styling</label>
+            <p class="hint">Animated skull intro</p>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="extraToggle">
+            <span class="toggle-track"></span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="actions">
+        <button id="previewBtn" class="btn btn-secondary">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M8 5v14l11-7z" />
+          </svg>
+          Preview
+        </button>
+        <button id="downloadBtn" class="btn btn-primary">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+          Download
+        </button>
+      </div>
+    </aside>
+
+    <!-- Preview Area -->
+    <main class="preview-area">
+      <canvas id="renderCanvas" width="522" height="178"></canvas>
+    </main>
+  </div>
+
+  <script src="app.js?v=4"></script>
+</body>
+
+</html>

@@ -1,0 +1,6 @@
+ffmpeg
+ffmpeg_src/
+build_ffmpeg.sh
+.git
+.DS_Store
+__pycache__/
