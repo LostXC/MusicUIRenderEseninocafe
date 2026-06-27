@@ -69,7 +69,7 @@ let clockIconImg = null;
 (function loadClockIcon() {
   const img = new Image();
   img.onload = () => { clockIconImg = img; };
-  img.src = 'assets/icon-clock.svg';
+  img.src = 'assets/icons/clock.svg';
 })();
 
 let containerW = 504;
