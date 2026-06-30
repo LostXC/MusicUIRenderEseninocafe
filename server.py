@@ -7,7 +7,6 @@ Usage:  python3 server.py
         → opens http://localhost:8000
 """
 
-import base64
 import json
 import os
 import re
@@ -15,10 +14,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.request
 import urllib.error
 import urllib.parse
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 import webbrowser
 from typing import Dict
@@ -28,8 +28,10 @@ from spotify_scraper import get_track_info
 PORT = int(os.environ.get("PORT", 8000))
 DIR = Path(__file__).parent
 
-# Store in-progress render sessions
+# Store in-progress render sessions. Guarded by a lock because frames upload in
+# parallel across multiple server threads.
 sessions: Dict[str, str] = {}  # session_id → temp_dir path
+sessions_lock = threading.Lock()
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -37,9 +39,12 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(DIR), **kwargs)
 
     def do_POST(self):
-        if self.path == '/render':
-            self._handle_render()
-        elif self.path == '/spotify-info':
+        path = urllib.parse.urlparse(self.path).path
+        if path == '/frame':
+            self._handle_frame()
+        elif path == '/finalize':
+            self._handle_finalize()
+        elif path == '/spotify-info':
             self._handle_spotify_info()
         else:
             self.send_error(404)
@@ -117,43 +122,61 @@ class Handler(SimpleHTTPRequestHandler):
     # Render / FFmpeg export endpoint
     # ------------------------------------------------------------------
 
-    def _handle_render(self):
+    def _handle_frame(self):
+        """Receive ONE frame as raw PNG bytes and save it. Stateless and
+        thread-safe, so the client can fire many uploads in parallel."""
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        session_id = q.get('session', [''])[0]
+        index = int(q.get('index', ['0'])[0])
+
         content_len = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_len)
-        data = json.loads(body)
+        png_bytes = self.rfile.read(content_len)
 
-        session_id = data['session']
-        start_idx  = data['startIndex']
-        frames     = data['frames']
-        fps        = data['fps']
-        total      = data['totalFrames']
-        is_final   = data['final']
-
-        # Create or retrieve temp dir for this session
-        if session_id not in sessions:
-            tmp = tempfile.mkdtemp(prefix='musicui_')
-            sessions[session_id] = tmp
-        tmp = sessions[session_id]
-
-        # Save PNG frames
-        for i, data_url in enumerate(frames):
-            idx = start_idx + i
-            # Strip data:image/png;base64, prefix
-            header, b64 = data_url.split(',', 1)
-            png_bytes = base64.b64decode(b64)
-            frame_path = os.path.join(tmp, f'frame_{idx:04d}.png')
-            with open(frame_path, 'wb') as f:
-                f.write(png_bytes)
-
-        if not is_final:
-            # Acknowledge batch, wait for more
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'ok')
+        if not session_id:
+            self.send_error(400, "Missing session")
             return
 
-        # ── Final batch: encode .MOV with FFmpeg qtrle (Animation) + alpha ──
+        # Create or retrieve the session temp dir (lock: parallel threads).
+        with sessions_lock:
+            tmp = sessions.get(session_id)
+            if tmp is None:
+                tmp = tempfile.mkdtemp(prefix='musicui_')
+                sessions[session_id] = tmp
+
+        frame_path = os.path.join(tmp, f'frame_{index:04d}.png')
+        with open(frame_path, 'wb') as f:
+            f.write(png_bytes)
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'ok')
+
+    def _handle_finalize(self):
+        """All frames are uploaded — encode the .MOV and stream it back."""
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        session_id = q.get('session', [''])[0]
+        fps = q.get('fps', ['25'])[0]
+        total = int(q.get('total', ['0'])[0])
+
+        with sessions_lock:
+            tmp = sessions.get(session_id)
+
+        if not tmp:
+            self.send_error(400, "Unknown session")
+            return
+
+        # Guard against encoding before every frame has landed.
+        present = len([n for n in os.listdir(tmp)
+                       if n.startswith('frame_') and n.endswith('.png')])
+        if total and present < total:
+            self.send_response(500)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f'Missing frames: {present}/{total} uploaded'.encode())
+            return
+
+        # ── Encode .MOV with FFmpeg qtrle (Animation) + alpha ──
         out_path = os.path.join(tmp, 'output.mov')
 
         # Check if local ffmpeg exists, otherwise rely on system ffmpeg
@@ -210,7 +233,8 @@ class Handler(SimpleHTTPRequestHandler):
         finally:
             # Cleanup
             shutil.rmtree(tmp, ignore_errors=True)
-            sessions.pop(session_id, None)
+            with sessions_lock:
+                sessions.pop(session_id, None)
 
 
 if __name__ == '__main__':
@@ -227,7 +251,11 @@ if __name__ == '__main__':
             pass
 
     try:
-        HTTPServer(('', PORT), Handler).serve_forever()
+        # Threaded so parallel frame uploads (and the static file serving) don't
+        # queue behind one another.
+        httpd = ThreadingHTTPServer(('', PORT), Handler)
+        httpd.daemon_threads = True
+        httpd.serve_forever()
     except KeyboardInterrupt:
         print('\n  Server stopped.')
         # Cleanup any remaining temp dirs

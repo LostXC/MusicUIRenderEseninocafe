@@ -31,7 +31,7 @@ const CFG = {
 
   // Animation timing
   strokeEnd: 520,
-  fillStart: 320, fillEnd: 800,
+  fillStart: 320, fillEnd: 700,
   contentStart: 440, contentEnd: 800,
 
   // Skull Animation (Cavalry margin compensation: 1920x1080 -> skull is at ~90, 590)
@@ -55,9 +55,10 @@ const CFG = {
   pillPadX: 12,
   pillPadY: 10,
   pillExtension: 30, // how far the pill's top extends up behind the card (like the multichat header)
+  pillFadeDelay: 320, // delay the pill's intro fade-in so the card is opaque first and hides its tucked-in top
 
   // Export settings
-  fps: 25,
+  fps: 60,
   idleDuration: 7200,
 };
 
@@ -585,10 +586,18 @@ function render(introMs, noiseT, isExporting = false) {
   let strokeP = 1, fillA = 1, contentA = 1;
   const clamp = (v) => Math.max(0, Math.min(1, v));
 
+  // "Picked by" pill fades in on its own, delayed clock so the card is already
+  // opaque before it appears (hides the pill top that tucks behind the card).
+  let pillFillA = 1, pillContentA = 1;
+
   if (introMs !== Infinity) {
     strokeP = clamp(introMs / CFG.strokeEnd);
     fillA = clamp((introMs - CFG.fillStart) / (CFG.fillEnd - CFG.fillStart));
     contentA = clamp((introMs - CFG.contentStart) / (CFG.contentEnd - CFG.contentStart));
+
+    const pillMs = introMs - CFG.pillFadeDelay;
+    pillFillA = clamp((pillMs - CFG.fillStart) / (CFG.fillEnd - CFG.fillStart));
+    pillContentA = clamp((pillMs - CFG.contentStart) / (CFG.contentEnd - CFG.contentStart));
   }
 
   // Extra Styling Opacity Fade (Frame 9 to 16 if intro is on)
@@ -602,12 +611,12 @@ function render(introMs, noiseT, isExporting = false) {
   // "Picked by" pill — its own boiling outline, drawn BEHIND the card so its
   // top tucks behind and only the bottom-left tag protrudes (like the
   // multichat announcement header).
-  if (L.pill && fillA > 0) {
+  if (L.pill && pillFillA > 0) {
     const pillBase = buildBasePath(L.pill.w, L.pill.h, L.pill.r)
       .map(p => ({ x: p.x + L.pill.x, y: p.y + L.pill.y }));
     const pillPts = deformPath(pillBase, noiseT, seed + 137.0);
 
-    ctx.globalAlpha = fillA;
+    ctx.globalAlpha = pillFillA;
     ctx.fillStyle = '#ffffff';
     traceSmoothPath(ctx, pillPts);
     ctx.fill();
@@ -706,9 +715,9 @@ function render(introMs, noiseT, isExporting = false) {
   }
 
   // "Picked by {username}" pill text — sits in the protruding bottom tag.
-  if (L.pill && contentA > 0) {
+  if (L.pill && pillContentA > 0) {
     const pl = L.pill;
-    ctx.globalAlpha = contentA;
+    ctx.globalAlpha = pillContentA;
     ctx.fillStyle = '#000000';
     ctx.textBaseline = 'alphabetic';
     const ty = pl.y + pl.h - CFG.pillPadY - pl.descent;
@@ -775,7 +784,11 @@ function playIntro() {
   if (!state.useAnim) return;
   loopStart = performance.now();
   introActive = true;
-  const totalIntroMs = Math.max(CFG.contentEnd, CFG.piercingDuration);
+  // When a "Picked by" pill is shown, keep the intro running long enough for its
+  // delayed fade-in to finish, otherwise it would snap to full at the cut-off.
+  const pillEnd = (state.pickedBy && state.pickedBy.trim())
+    ? CFG.contentEnd + CFG.pillFadeDelay : 0;
+  const totalIntroMs = Math.max(CFG.contentEnd, CFG.piercingDuration, pillEnd);
   setTimeout(() => { introActive = false; }, totalIntroMs + 100);
 }
 
@@ -815,9 +828,13 @@ for (let i = 0; i <= PD_TOTAL; i++) {
 }
 renderFrameImg.src = pdSrcs[0];
 
-// Progress state — fed by exportMOV with the real frame counts.
+// Progress state — exportMOV feeds the *target*; the displayed count eases toward
+// it every frame so the bar always glides one frame at a time, instead of jumping
+// in upload-batch chunks.
 let renderTotalFrames = 0;
-let renderedFrames = 0;
+let renderTargetFrames = 0;   // real progress (frames confirmed on the server)
+let renderedFrames = 0;       // displayed value, eased toward the target
+let renderEaseTs = null;      // last ease timestamp (time-based, rAF-rate independent)
 let renderUiActive = false;
 let renderUiRaf = null;
 let pdStart = null, pdShown = -1;
@@ -831,6 +848,17 @@ function renderUiTick(ts) {
   const t = (ts - pdStart) % PD_CYCLE_MS;
   const idx = Math.min(PD_TOTAL, Math.floor(t / PD_FRAME_MS));   // clamps during HOLD
   if (idx !== pdShown) { renderFrameImg.src = pdSrcs[idx]; pdShown = idx; }
+
+  // Ease the displayed count toward the real target. Time-based (per elapsed ms,
+  // not per tick) so it tracks correctly even when rAF is throttled, and always
+  // glides instead of jumping in upload-batch chunks.
+  const dt = renderEaseTs === null ? 0 : Math.min(250, ts - renderEaseTs);
+  renderEaseTs = ts;
+  if (renderedFrames !== renderTargetFrames) {
+    const k = 1 - Math.exp(-dt / 90);
+    renderedFrames += (renderTargetFrames - renderedFrames) * k;
+    if (Math.abs(renderTargetFrames - renderedFrames) < 0.5) renderedFrames = renderTargetFrames;
+  }
 
   const progress = renderTotalFrames > 0 ? renderedFrames / renderTotalFrames : 0;
   const w = renderProgressTrack.clientWidth;
@@ -858,7 +886,9 @@ function renderUiTick(ts) {
 
 function showRenderStatus(total) {
   renderTotalFrames = total;
+  renderTargetFrames = 0;
   renderedFrames = 0;
+  renderEaseTs = null;
   if (renderStatusTitle) renderStatusTitle.textContent = 'Rendering frames';
   renderTotalEl.textContent = total;
   renderCountEl.textContent = '0';
@@ -870,8 +900,17 @@ function showRenderStatus(total) {
   }
 }
 
-function setRenderedFrames(n) {
-  renderedFrames = Math.min(renderTotalFrames, n);
+// Set the real progress target (frames confirmed on the server). The bar eases
+// toward this value in renderUiTick.
+function setRenderTarget(n) {
+  renderTargetFrames = Math.max(0, Math.min(renderTotalFrames, n));
+}
+
+// Snap the bar to 100% for the finish, once the .mov is in hand.
+function completeRenderStatus() {
+  renderTargetFrames = renderTotalFrames;
+  renderedFrames = renderTotalFrames;
+  renderCountEl.textContent = renderTotalFrames;
 }
 
 function hideRenderStatus() {
@@ -885,73 +924,89 @@ async function exportMOV() {
   const totalMs = introDur + CFG.idleDuration;
   const totalFrames = Math.ceil((totalMs / 1000) * CFG.fps);
   const frameDt = 1000 / CFG.fps;
+  const sessionId = Date.now().toString();
 
   showRenderStatus(totalFrames);
   stopLoop();
 
-  const frames = [];
-  for (let f = 0; f < totalFrames; f++) {
+  // Pipeline: render each frame, snapshot it as a binary PNG, and upload it while
+  // the next frames keep rendering. Transfer overlaps rendering (instead of running
+  // entirely after it), and several uploads fly at once. The ffmpeg encode is the
+  // fast part (<1s); the old bottleneck was ~20 sequential base64 batch round-trips.
+  const MAX_INFLIGHT = 6;          // concurrent uploads (also caps blobs held in memory)
+  const inflight = new Set();
+  let uploaded = 0;
+  let failed = null;
+
+  const snapshot = () => new Promise(res => canvas.toBlob(res, 'image/png'));
+
+  for (let f = 0; f < totalFrames && !failed; f++) {
     const timeMs = f * frameDt;
     const introMs = state.useAnim ? timeMs : Infinity;
     render(introMs, timeMs / 1000, true);
-    frames.push(canvas.toDataURL('image/png'));
-    setRenderedFrames(f + 1);
+    const blob = await snapshot();   // capture before the next render overwrites the canvas
+    if (!blob) { failed = new Error('frame capture failed'); break; }
 
-    if (f % 15 === 0) await new Promise(r => setTimeout(r, 0));
+    const task = (async () => {
+      try {
+        const res = await fetch(`/frame?session=${sessionId}&index=${f}&total=${totalFrames}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'image/png' },
+          body: blob,
+        });
+        if (!res.ok) throw new Error(await res.text());
+        uploaded++;
+        setRenderTarget(uploaded);
+      } catch (e) {
+        failed = failed || e;
+      }
+      inflight.delete(task);
+    })();
+    inflight.add(task);
+
+    if (inflight.size >= MAX_INFLIGHT) await Promise.race(inflight);
   }
 
-  // Frames rendered — hold the bar full while we upload + encode.
-  setRenderedFrames(totalFrames);
-  
-  // Resume the main canvas idle animation so the card doesn't look frozen!
-  syncCanvasSize(false);
-  startLoop();
+  await Promise.allSettled(inflight);
 
-  await new Promise(r => setTimeout(r, 10));
+  if (failed) {
+    alert('Render upload failed: ' + failed.message);
+    hideRenderStatus();
+    syncCanvasSize(false);
+    startLoop();
+    return;
+  }
 
-  const BATCH = 25;
-  const sessionId = Date.now().toString();
-
+  // Every frame is on the server — trigger the (fast) encode and download the .mov.
   if (renderStatusTitle) renderStatusTitle.textContent = 'Encoding video';
-  setRenderedFrames(0);
+  setRenderTarget(totalFrames);
 
-  for (let i = 0; i < frames.length; i += BATCH) {
-    // Yield to the UI before a heavy JSON stringify + fetch
-    await new Promise(r => setTimeout(r, 10));
-    
-    const batch = frames.slice(i, i + BATCH);
-    const res = await fetch('/render', {
+  let res;
+  try {
+    res = await fetch(`/finalize?session=${sessionId}&fps=${CFG.fps}&total=${totalFrames}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session: sessionId,
-        startIndex: i,
-        frames: batch,
-        fps: CFG.fps,
-        totalFrames,
-        final: (i + BATCH) >= frames.length,
-      }),
     });
-
-    if (!res.ok) {
-      alert('Server error: ' + (await res.text()));
-      hideRenderStatus();
-      startLoop();
-      return;
-    }
-
-    setRenderedFrames(Math.min(frames.length, i + BATCH));
-
-    if ((i + BATCH) >= frames.length) {
-      const blob = await res.blob();
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `music-ui-${state.title.replace(/\s+/g, '-').toLowerCase()}.mov`;
-      a.click();
-      URL.revokeObjectURL(a.href);
-    }
+  } catch (e) {
+    alert('Encode request failed: ' + e.message);
+    hideRenderStatus(); syncCanvasSize(false); startLoop();
+    return;
   }
 
+  if (!res.ok) {
+    alert('Server error: ' + (await res.text()));
+    hideRenderStatus(); syncCanvasSize(false); startLoop();
+    return;
+  }
+
+  const blob = await res.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `music-ui-${state.title.replace(/\s+/g, '-').toLowerCase()}.mov`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+
+  completeRenderStatus();                       // fill the bar to 100%
+  await new Promise(r => setTimeout(r, 250));   // brief "done" hold
   hideRenderStatus();
   syncCanvasSize(false);
   startLoop();
