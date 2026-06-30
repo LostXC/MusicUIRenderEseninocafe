@@ -44,6 +44,17 @@ const CFG = {
   piercingFramesCount: 35,
   piercingFPS: 25,
   piercingDuration: 1400, // 35 frames at 25fps = 1400ms
+  // Keyhole/earring circle centre within the 60×100 sprite (used to align it on the pill)
+  piercingCircleDX: 23.66,
+  piercingCircleDY: 57.04,
+  pillPiercePad: 10,  // equal padding to the left and right of the earring inside the pill
+  pillPierceW: 24,    // visible width of the keyhole footprint
+
+  // "Picked by" pill (attachment container at the card's bottom-right)
+  pillFont: 20,
+  pillPadX: 12,
+  pillPadY: 10,
+  pillExtension: 30, // how far the pill's top extends up behind the card (like the multichat header)
 
   // Export settings
   fps: 25,
@@ -73,6 +84,7 @@ let clockIconImg = null;
 })();
 
 let containerW = 504;
+let currentLayout = null;
 let loopId = null;
 let loopStart = null;
 let introActive = false;
@@ -82,6 +94,7 @@ const state = {
   artist: 'Marty Robbins',
   album: 'Gunfighter Ballads And Trail Songs',
   duration: '3:55',
+  pickedBy: '',
   useAnim: false,
   extraStyling: false,
   artZoom: 1,
@@ -107,6 +120,35 @@ function preloadPiercing() {
 }
 preloadPiercing();
 
+// Measures the actual opaque bounds of the earring within its 60×100 sprite (from
+// the final/static frame) so it can be centred with equal padding on the pill.
+let piercingMetrics = null;
+function measurePiercing() {
+  if (piercingMetrics) return piercingMetrics;
+  const frame = piercingFrames[CFG.piercingFramesCount - 1];
+  if (!frame || !frame.complete || !frame.naturalWidth) return null;
+  const sw = 60, sh = 100;
+  try {
+    const tc = document.createElement('canvas');
+    tc.width = sw; tc.height = sh;
+    const t = tc.getContext('2d', { willReadFrequently: true });
+    t.drawImage(frame, 504, 624, sw, sh, 0, 0, sw, sh);
+    const d = t.getImageData(0, 0, sw, sh).data;
+    let minX = sw, maxX = -1, minY = sh, maxY = -1;
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < sw; x++) {
+        if (d[(y * sw + x) * 4 + 3] > 16) {
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < 0) return null;
+    piercingMetrics = { cx: (minX + maxX) / 2, w: maxX - minX + 1 };
+  } catch (e) { return null; }
+  return piercingMetrics;
+}
+
 // ── DOM ──
 const canvas = document.getElementById('renderCanvas');
 const ctx = canvas.getContext('2d', { willReadFrequently: false });
@@ -118,6 +160,7 @@ const titleInput = document.getElementById('titleInput');
 const artistInput = document.getElementById('artistInput');
 const albumInput = document.getElementById('albumInput');
 const durationInput = document.getElementById('durationInput');
+const pickedByInput = document.getElementById('pickedByInput');
 const spotifyInput = document.getElementById('spotifyInput');
 const animToggle = document.getElementById('animToggle');
 const previewBtn = document.getElementById('previewBtn');
@@ -126,6 +169,8 @@ const extraToggle = document.getElementById('extraToggle');
 const zoomInBtn = document.getElementById('zoomInBtn');
 const zoomOutBtn = document.getElementById('zoomOutBtn');
 const zoomLevelEl = document.getElementById('zoomLevel');
+const themeToggle = document.getElementById('themeToggle');
+const themeIcon = document.getElementById('themeIcon');
 
 async function handleSpotifyAutofill(urlOrQuery) {
   if (!urlOrQuery) return;
@@ -316,45 +361,135 @@ function traceSmoothPath(c, pts, progress = 1) {
 // DYNAMIC SIZING & DRAWING
 // ══════════════════════════════════
 
-function measureContainerW() {
+// Computes the full layout for a frame: the main card width, the optional
+// "Picked by" pill geometry, where the piercing earring attaches, and the
+// overall content bounds (used to size the canvas).
+function computeLayout() {
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.font = '600 30px Inter, -apple-system, sans-serif';
-  const tw = ctx.measureText(state.title || ' ').width;
-  ctx.font = '500 20px Inter, -apple-system, sans-serif';
-  const aw = ctx.measureText(state.album || ' ').width;
-  const artW = ctx.measureText(state.artist || ' ').width;
-  const durW = ctx.measureText(state.duration || ' ').width;
-  
-  const topTextContainerW = TEXT_X + Math.max(tw, aw) + CFG.rightPad;
-  
-  let bottomRowContainerW = TEXT_X + artW + 31.5 + durW;
-  if (state.extraStyling) {
-    const earringW = 60 * CFG.piercingScale;
-    const minSpacing = -30;
-    const rightPad = 12;
-    bottomRowContainerW += minSpacing + earringW + rightPad;
+  const mt = (font, s) => { ctx.font = font; return ctx.measureText(s && s.length ? s : ' ').width; };
+
+  const F30 = '600 30px Inter, -apple-system, sans-serif';
+  const F20 = '500 20px Inter, -apple-system, sans-serif';
+  const tw = mt(F30, state.title);
+  const aw = mt(F20, state.album);
+  const artW = mt(F20, state.artist);
+  const durW = mt(F20, state.duration);
+
+  const topTextW = TEXT_X + Math.max(tw, aw) + CFG.rightPad;
+  const bottomBase = TEXT_X + artW + 31.5 + durW;
+
+  const earringW = 60 * CFG.piercingScale;
+  const piercingPad = -30 + earringW + 12; // matches the original bottom-row earring spacing
+  const cardNoPierce = Math.max(topTextW, bottomBase + CFG.rightPad, CFG.minWidth);
+  const cardPierce = Math.max(topTextW, bottomBase + piercingPad, CFG.minWidth);
+
+  // Earring footprint from the measured sprite bounds (falls back to config).
+  const pm = measurePiercing();
+  const earCX = (pm ? pm.cx : CFG.piercingCircleDX) * CFG.piercingScale;
+  const earVisW = (pm ? pm.w : CFG.pillPierceW) * CFG.piercingScale;
+  // Left visual edge of the card's bottom-right keyhole (if the piercing stayed on the
+  // card). Once the pill reaches it, the keyhole would overlap the pill text, so the
+  // piercing moves to the pill instead.
+  const cardKeyholeLeft = cardPierce + 12 - earringW + (earCX - earVisW / 2);
+
+  const name = state.pickedBy || '';
+  const pillShow = name.trim().length > 0;
+
+  let pill = null, pierce = null, cardW, overallW;
+
+  if (pillShow) {
+    const LF = '500 ' + CFG.pillFont + 'px Inter, -apple-system, sans-serif';
+    const NF = '600 ' + CFG.pillFont + 'px Inter, -apple-system, sans-serif';
+    const labelW = mt(LF, 'Picked by ');
+    const textW = labelW + mt(NF, name);
+
+    ctx.font = NF;
+    const fm = ctx.measureText(name + 'Ag');
+    const ascent = fm.actualBoundingBoxAscent || CFG.pillFont * 0.72;
+    const descent = fm.actualBoundingBoxDescent || CFG.pillFont * 0.28;
+    // Visible "tag" = the text with its 10px padding; the border extends further
+    // UP (pillExtension) so its rounded top tucks behind the card.
+    const tagH = CFG.pillPadY * 2 + ascent + descent;
+    const pillH = CFG.pillExtension + tagH;
+    const pillNoPierceW = textW + CFG.pillPadX * 2;
+
+    const pillTextRight = CFG.pillPadX + textW; // right edge of the pill's text
+    let pillW;
+    if (state.extraStyling && (pillTextRight + 18) > cardKeyholeLeft) {
+      // The pill text reaches the card's keyhole → the pill gets the piercing (with equal
+      // padding on each side) and drives the width.
+      pierce = { target: 'pill' };
+      pillW = CFG.pillPadX + textW + CFG.pillPiercePad + earVisW + CFG.pillPiercePad;
+      cardW = cardNoPierce;
+    } else if (state.extraStyling) {
+      pierce = { target: 'card' };
+      cardW = cardPierce;
+      pillW = pillNoPierceW;
+    } else {
+      cardW = cardNoPierce;
+      pillW = pillNoPierceW;
+    }
+
+    overallW = Math.max(cardW, pillW);
+    const pillR = Math.min(CFG.cornerRadius, pillH / 2, pillW / 2);
+    const pillX = 0; // left-aligned with the card
+    const pillY = CONTAINER_H - CFG.pillExtension; // top tucked behind the card
+    pill = { x: pillX, y: pillY, w: pillW, h: pillH, r: pillR, descent, labelW };
+
+    if (pierce) {
+      const sc = CFG.piercingScale;
+      if (pierce.target === 'pill') {
+        // Centre the keyhole in its slot (equal L/R padding) and align its circle
+        // to the vertical centre of the pill text.
+        const slotCenter = CFG.pillPadX + textW + CFG.pillPiercePad + earVisW / 2;
+        const textCenterY = (pillY + pillH) - CFG.pillPadY - (ascent + descent) / 2;
+        pierce.destX = slotCenter - earCX;
+        pierce.destY = textCenterY - CFG.piercingCircleDY * sc;
+      } else {
+        pierce.destX = overallW + 12 - earringW;
+        pierce.destY = CONTAINER_H - (100 * sc * 0.8) - 2;
+      }
+    }
   } else {
-    bottomRowContainerW += CFG.rightPad;
+    if (state.extraStyling) {
+      pierce = { target: 'card' };
+      cardW = cardPierce;
+    } else {
+      cardW = cardNoPierce;
+    }
+    overallW = cardW;
+    if (pierce) {
+      const sh = 100;
+      pierce.destX = overallW + 12 - earringW;
+      pierce.destY = CONTAINER_H - (sh * CFG.piercingScale * 0.8) - 2;
+    }
   }
 
   ctx.restore();
 
-  return Math.max(Math.max(topTextContainerW, bottomRowContainerW), CFG.minWidth);
+  let contentBottom = CONTAINER_H;
+  if (pill) contentBottom = Math.max(contentBottom, pill.y + pill.h);
+  if (pierce) contentBottom = Math.max(contentBottom, pierce.destY + 100 * CFG.piercingScale);
+
+  return { cardW, overallW, pill, pierce, contentBottom };
 }
 
 function syncCanvasSize(isExporting = false) {
-  const w = Math.ceil(measureContainerW());
+  currentLayout = computeLayout();
   const S = isExporting ? CFG.exportScale : CFG.uiScale;
+  const w = Math.ceil(currentLayout.overallW);
+  const h = Math.ceil(currentLayout.contentBottom);
+  containerW = w;
 
-  if (Math.abs(w - containerW) > 1 || canvas.dataset.currentScale != S) {
-    containerW = w;
-    canvas.width = Math.floor((containerW + CFG.padding * 2) * S);
-    canvas.height = Math.floor((CONTAINER_H + CFG.padding * 2) * S);
+  const cw = Math.floor((w + CFG.padding * 2) * S);
+  const ch = Math.floor((h + CFG.padding * 2) * S);
 
-    // Keep the CSS visual size identical
-    canvas.style.width = (containerW + CFG.padding * 2) + 'px';
-    canvas.style.height = (CONTAINER_H + CFG.padding * 2) + 'px';
+  if (canvas.width !== cw || canvas.height !== ch || canvas.dataset.currentScale != S) {
+    canvas.width = cw;
+    canvas.height = ch;
+    canvas.style.width = (w + CFG.padding * 2) + 'px';
+    canvas.style.height = (h + CFG.padding * 2) + 'px';
     canvas.dataset.currentScale = S;
   }
 }
@@ -429,10 +564,34 @@ function render(introMs, noiseT, isExporting = false) {
     stylingAlpha = clamp((introMs - 360) / (640 - 360));
   }
 
-  const base = buildBasePath(containerW, CONTAINER_H, CFG.cornerRadius);
+  const L = currentLayout;
+
+  // "Picked by" pill — its own boiling outline, drawn BEHIND the card so its
+  // top tucks behind and only the bottom-left tag protrudes (like the
+  // multichat announcement header).
+  if (L.pill && fillA > 0) {
+    const pillBase = buildBasePath(L.pill.w, L.pill.h, L.pill.r)
+      .map(p => ({ x: p.x + L.pill.x, y: p.y + L.pill.y }));
+    const pillPts = deformPath(pillBase, noiseT, seed + 137.0);
+
+    ctx.globalAlpha = fillA;
+    ctx.fillStyle = '#ffffff';
+    traceSmoothPath(ctx, pillPts);
+    ctx.fill();
+
+    ctx.strokeStyle = '#000000';
+    ctx.lineWidth = CFG.strokeWidth;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    traceSmoothPath(ctx, pillPts);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  const base = buildBasePath(L.overallW, CONTAINER_H, CFG.cornerRadius);
   const pts = deformPath(base, noiseT, seed);
 
-  // Fill
+  // Card fill
   if (fillA > 0) {
     ctx.globalAlpha = fillA;
     ctx.fillStyle = '#ffffff';
@@ -440,7 +599,7 @@ function render(introMs, noiseT, isExporting = false) {
     ctx.fill();
   }
 
-  // Stroke
+  // Card stroke
   ctx.globalAlpha = 1;
   ctx.strokeStyle = '#000000';
   ctx.lineWidth = CFG.strokeWidth;
@@ -513,6 +672,21 @@ function render(introMs, noiseT, isExporting = false) {
     }
   }
 
+  // "Picked by {username}" pill text — sits in the protruding bottom tag.
+  if (L.pill && contentA > 0) {
+    const pl = L.pill;
+    ctx.globalAlpha = contentA;
+    ctx.fillStyle = '#000000';
+    ctx.textBaseline = 'alphabetic';
+    const ty = pl.y + pl.h - CFG.pillPadY - pl.descent;
+    const tx = pl.x + CFG.pillPadX;
+    ctx.font = '500 ' + CFG.pillFont + 'px Inter, -apple-system, sans-serif';
+    ctx.fillText('Picked by ', tx, ty);
+    ctx.font = '600 ' + CFG.pillFont + 'px Inter, -apple-system, sans-serif';
+    ctx.fillText(state.pickedBy, tx + pl.labelW, ty);
+    ctx.globalAlpha = 1;
+  }
+
   const getFrame = (framesArr, fps, count) => {
     const frameIdx = (introMs === Infinity)
       ? count - 1
@@ -532,24 +706,15 @@ function render(introMs, noiseT, isExporting = false) {
     }
   }
 
-  // Extra Styling (Piercing Animation) - Bottom Right
-  if (state.extraStyling && contentA > 0) {
+  // Extra Styling (Piercing Animation) - attaches to whichever element is the
+  // bottom-right-most: the card normally, or the pill when it drives the width.
+  if (state.extraStyling && contentA > 0 && L.pierce) {
     const frame = getFrame(piercingFrames, CFG.piercingFPS, CFG.piercingFramesCount);
     if (frame && frame.complete) {
       ctx.save();
       ctx.globalAlpha = contentA * stylingAlpha;
       const sx = 504, sy = 624, sw = 60, sh = 100;
-
-      const earringW = sw * CFG.piercingScale;
-      // Anchor to the right side with user's tweaked padding
-      const destX = containerW + 12 - earringW;
-      
-      // Keep it in the bottom right corner (adjusting textY since it shifted)
-      const hasAlbum = state.album && state.album.trim().length > 0;
-      const textY = hasAlbum ? 86 : 72;
-      const destY = CONTAINER_H - (sh * CFG.piercingScale * 0.8) - 2;
-
-      ctx.drawImage(frame, sx, sy, sw, sh, destX, destY, sw * CFG.piercingScale, sh * CFG.piercingScale);
+      ctx.drawImage(frame, sx, sy, sw, sh, L.pierce.destX, L.pierce.destY, sw * CFG.piercingScale, sh * CFG.piercingScale);
       ctx.restore();
     }
   }
@@ -585,21 +750,92 @@ function playIntro() {
 // EXPORT — PNG frames → server → .MOV
 // ══════════════════════════════════
 
-function showStatus(msg) {
-  let ov = document.querySelector('.status-overlay');
-  if (!ov) {
-    ov = document.createElement('div');
-    ov.className = 'status-overlay';
-    ov.innerHTML = '<div class="status-box"><div class="spinner"></div><p></p></div>';
-    document.body.appendChild(ov);
-  }
-  ov.querySelector('p').textContent = msg;
-  ov.style.display = 'flex';
-  return ov;
+// ── Rendering frames UI (inline progress above the action buttons) ──
+// Replaces the old modal status overlay: a pencil-draw animation plus a
+// sine-wave progress bar driven by the real export frame counts.
+const renderStatus = document.getElementById('renderStatus');
+const renderFrameImg = document.getElementById('renderFrame');
+const renderCountEl = document.getElementById('renderCount');
+const renderTotalEl = document.getElementById('renderTotal');
+const renderProgressTrack = document.getElementById('renderProgressTrack');
+const renderProgressSvg = document.getElementById('renderProgressSvg');
+const renderProgressPath = document.getElementById('renderProgressPath');
+const renderThumb = document.getElementById('renderThumb');
+
+// Pencil-draw animation — time-based so the speed is independent of refresh rate.
+const PD_TOTAL = 34, PD_FPS = 30, PD_HOLD = 400;
+const PD_FRAME_MS = 1000 / PD_FPS;
+const PD_CYCLE_MS = PD_TOTAL * PD_FRAME_MS + PD_HOLD;
+const pdSrcs = [];
+for (let i = 0; i <= PD_TOTAL; i++) {
+  const s = `assets/pencil-draw/pencil-draw.${i}.svg`;
+  pdSrcs.push(s);
+  const pre = new Image(); pre.src = s;   // preload to avoid flicker
 }
-function hideStatus() {
-  const ov = document.querySelector('.status-overlay');
-  if (ov) ov.style.display = 'none';
+renderFrameImg.src = pdSrcs[0];
+
+// Progress state — fed by exportMOV with the real frame counts.
+let renderTotalFrames = 0;
+let renderedFrames = 0;
+let renderUiActive = false;
+let renderUiRaf = null;
+let pdStart = null, pdShown = -1;
+
+// Sine-wave logic borrowed from the music player's tickPlayer: the wave is drawn
+// from x=0 to the thumb, which sits at rendered/total.
+function renderUiTick(ts) {
+  if (!renderUiActive) return;
+
+  if (pdStart === null) pdStart = ts;
+  const t = (ts - pdStart) % PD_CYCLE_MS;
+  const idx = Math.min(PD_TOTAL, Math.floor(t / PD_FRAME_MS));   // clamps during HOLD
+  if (idx !== pdShown) { renderFrameImg.src = pdSrcs[idx]; pdShown = idx; }
+
+  const progress = renderTotalFrames > 0 ? renderedFrames / renderTotalFrames : 0;
+  const w = renderProgressTrack.clientWidth;
+  const R = 7;                                   // thumb radius — keep it inside the track
+  const thumbX = progress * Math.max(0, w - R);
+
+  renderThumb.style.left = thumbX + 'px';
+  renderProgressSvg.style.width = Math.min(w, thumbX + R) + 'px';
+
+  let d = 'M 0 7';
+  if (thumbX > 0) {
+    const segments = Math.max(10, Math.floor(thumbX / 2));
+    d = '';
+    for (let i = 0; i <= segments; i++) {
+      const px = (i / segments) * thumbX;
+      const py = 7 + Math.sin((px * 0.15) + (ts * 0.004)) * 1.5;
+      d += (i === 0 ? 'M ' : ' L ') + px + ' ' + py;
+    }
+  }
+  renderProgressPath.setAttribute('d', d);
+  renderCountEl.textContent = Math.round(renderedFrames);
+
+  renderUiRaf = requestAnimationFrame(renderUiTick);
+}
+
+function showRenderStatus(total) {
+  renderTotalFrames = total;
+  renderedFrames = 0;
+  renderTotalEl.textContent = total;
+  renderCountEl.textContent = '0';
+  renderStatus.hidden = false;
+  if (!renderUiActive) {
+    renderUiActive = true;
+    pdStart = null; pdShown = -1;
+    renderUiRaf = requestAnimationFrame(renderUiTick);
+  }
+}
+
+function setRenderedFrames(n) {
+  renderedFrames = Math.min(renderTotalFrames, n);
+}
+
+function hideRenderStatus() {
+  renderUiActive = false;
+  if (renderUiRaf) { cancelAnimationFrame(renderUiRaf); renderUiRaf = null; }
+  renderStatus.hidden = true;
 }
 
 async function exportMOV() {
@@ -608,7 +844,7 @@ async function exportMOV() {
   const totalFrames = Math.ceil((totalMs / 1000) * CFG.fps);
   const frameDt = 1000 / CFG.fps;
 
-  const overlay = showStatus('Rendering frames…');
+  showRenderStatus(totalFrames);
   stopLoop();
 
   const frames = [];
@@ -617,15 +853,13 @@ async function exportMOV() {
     const introMs = state.useAnim ? timeMs : Infinity;
     render(introMs, timeMs / 1000, true);
     frames.push(canvas.toDataURL('image/png'));
+    setRenderedFrames(f + 1);
 
-    if (f % 15 === 0) {
-      overlay.querySelector('p').textContent =
-        `Rendering frame ${f + 1} / ${totalFrames}…`;
-      await new Promise(r => setTimeout(r, 0));
-    }
+    if (f % 15 === 0) await new Promise(r => setTimeout(r, 0));
   }
 
-  overlay.querySelector('p').textContent = 'Sending to server…';
+  // Frames rendered — hold the bar full while we upload + encode.
+  setRenderedFrames(totalFrames);
   await new Promise(r => setTimeout(r, 0));
 
   const BATCH = 25;
@@ -648,26 +882,22 @@ async function exportMOV() {
 
     if (!res.ok) {
       alert('Server error: ' + (await res.text()));
-      hideStatus();
+      hideRenderStatus();
       startLoop();
       return;
     }
 
     if ((i + BATCH) >= frames.length) {
-      overlay.querySelector('p').textContent = 'Encoding .mov…';
       const blob = await res.blob();
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = `music-ui-${state.title.replace(/\s+/g, '-').toLowerCase()}.mov`;
       a.click();
       URL.revokeObjectURL(a.href);
-    } else {
-      overlay.querySelector('p').textContent =
-        `Uploading frames ${i + 1}–${Math.min(i + BATCH, frames.length)} / ${frames.length}…`;
     }
   }
 
-  hideStatus();
+  hideRenderStatus();
   syncCanvasSize(false);
   startLoop();
 }
@@ -707,6 +937,7 @@ titleInput.addEventListener('input', () => { state.title = titleInput.value || t
 artistInput.addEventListener('input', () => { state.artist = artistInput.value || artistInput.placeholder; });
 albumInput.addEventListener('input', () => { state.album = albumInput.value || albumInput.placeholder; });
 durationInput.addEventListener('input', () => { state.duration = durationInput.value || durationInput.placeholder; });
+pickedByInput.addEventListener('input', () => { state.pickedBy = pickedByInput.value; });
 animToggle.addEventListener('change', () => { state.useAnim = animToggle.checked; });
 previewBtn.addEventListener('click', playIntro);
 extraToggle.addEventListener('change', () => { state.extraStyling = extraToggle.checked; });
@@ -732,5 +963,23 @@ zoomOutBtn.addEventListener('click', () => {
 });
 
 updateZoomDisplay();
+
+function initTheme() {
+  const savedTheme = localStorage.getItem('theme');
+  if (savedTheme === 'light') {
+    document.body.classList.add('light-mode');
+    themeIcon.src = 'assets/icons/sun.svg';
+  } else {
+    themeIcon.src = 'assets/icons/moon.svg';
+  }
+}
+
+themeToggle.addEventListener('click', () => {
+  const isLight = document.body.classList.toggle('light-mode');
+  localStorage.setItem('theme', isLight ? 'light' : 'dark');
+  themeIcon.src = isLight ? 'assets/icons/sun.svg' : 'assets/icons/moon.svg';
+});
+
+initTheme();
 
 document.fonts.ready.then(() => { syncCanvasSize(); startLoop(); });
