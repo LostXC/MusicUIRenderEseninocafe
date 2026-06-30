@@ -175,10 +175,18 @@ const themeIcon = document.getElementById('themeIcon');
 async function handleSpotifyAutofill(urlOrQuery) {
   if (!urlOrQuery) return;
 
-  const hint = spotifyInput.parentElement.querySelector('.hint');
-  const oldHint = hint.textContent;
-  hint.textContent = "Searching Spotify...";
-  hint.style.color = "var(--accent)";
+  // Look for the label instead
+  const label = spotifyInput.closest('.field').querySelector('label');
+  let oldLabel = "";
+  
+  if (label) {
+    oldLabel = label.textContent;
+    label.textContent = "Loading...";
+    label.style.color = "var(--text-muted)";
+  } else {
+    // If there is no label element, change the placeholder temporarily!
+    spotifyInput.placeholder = "Loading...";
+  }
 
   try {
     const res = await fetch('/spotify-info', {
@@ -224,13 +232,38 @@ async function handleSpotifyAutofill(urlOrQuery) {
     }
   } catch (err) {
     console.error("Spotify autofill error:", err);
-    hint.textContent = "Track not found or invalid link.";
-    hint.style.color = "#ff4444";
+    
+    // Handle error visuals safely
+    if (label) {
+      label.textContent = "Track not found!";
+      label.style.color = "#ff4444";
+      setTimeout(() => {
+        label.textContent = oldLabel;
+        label.style.color = "";
+      }, 3000);
+    } else {
+      spotifyInput.value = "";
+      spotifyInput.placeholder = "Track not found!";
+      setTimeout(() => {
+        spotifyInput.placeholder = "Paste Spotify track URL...";
+      }, 3000);
+    }
     return;
   }
 
-  hint.textContent = oldHint;
-  hint.style.color = "";
+  // Show 'Done!' temporarily after a successful search
+  if (label) {
+    label.textContent = "Done!";
+    label.style.color = "";
+    setTimeout(() => {
+      label.textContent = oldLabel;
+    }, 2000);
+  } else {
+    spotifyInput.placeholder = "Done!";
+    setTimeout(() => {
+      spotifyInput.placeholder = "Paste Spotify track URL...";
+    }, 2000);
+  }
 }
 
 let spotifyTimeout = null;

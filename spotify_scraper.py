@@ -1,21 +1,3 @@
-"""
-spotify_scraper.py  –  Local module, no API key or pip install required.
-
-Drop this file next to server.py. It uses Spotify's public embed endpoint
-which is designed for third-party sites and requires no authentication.
-
-Usage:
-    from spotify_scraper import get_track_info
-    info = get_track_info("https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUIOKE")
-    # info = {
-    #   'title':        str,
-    #   'artist':       str,
-    #   'album':        str,
-    #   'duration_ms':  int,
-    #   'thumbnail_url':str | None,
-    # }
-"""
-
 import json
 import re
 import urllib.error
