@@ -787,6 +787,7 @@ function playIntro() {
 // Replaces the old modal status overlay: a pencil-draw animation plus a
 // sine-wave progress bar driven by the real export frame counts.
 const renderStatus = document.getElementById('renderStatus');
+const renderStatusTitle = document.getElementById('renderStatusTitle');
 const renderFrameImg = document.getElementById('renderFrame');
 const renderCountEl = document.getElementById('renderCount');
 const renderTotalEl = document.getElementById('renderTotal');
@@ -858,6 +859,7 @@ function renderUiTick(ts) {
 function showRenderStatus(total) {
   renderTotalFrames = total;
   renderedFrames = 0;
+  if (renderStatusTitle) renderStatusTitle.textContent = 'Rendering frames';
   renderTotalEl.textContent = total;
   renderCountEl.textContent = '0';
   renderStatus.hidden = false;
@@ -910,6 +912,9 @@ async function exportMOV() {
   const BATCH = 25;
   const sessionId = Date.now().toString();
 
+  if (renderStatusTitle) renderStatusTitle.textContent = 'Encoding video';
+  setRenderedFrames(0);
+
   for (let i = 0; i < frames.length; i += BATCH) {
     // Yield to the UI before a heavy JSON stringify + fetch
     await new Promise(r => setTimeout(r, 10));
@@ -934,6 +939,8 @@ async function exportMOV() {
       startLoop();
       return;
     }
+
+    setRenderedFrames(Math.min(frames.length, i + BATCH));
 
     if ((i + BATCH) >= frames.length) {
       const blob = await res.blob();
