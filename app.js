@@ -802,8 +802,15 @@ const PD_CYCLE_MS = PD_TOTAL * PD_FRAME_MS + PD_HOLD;
 const pdSrcs = [];
 for (let i = 0; i <= PD_TOTAL; i++) {
   const s = `assets/pencil-draw/pencil-draw.${i}.svg`;
-  pdSrcs.push(s);
-  const pre = new Image(); pre.src = s;   // preload to avoid flicker
+  pdSrcs.push(s); // fallback URL
+  
+  // Fetch as Blob to prevent network re-validation blocking during export
+  fetch(s).then(r => r.blob()).then(b => {
+    pdSrcs[i] = URL.createObjectURL(b);
+    if (i === 0 && renderFrameImg && !renderUiActive) renderFrameImg.src = pdSrcs[0];
+  }).catch(() => {
+    const pre = new Image(); pre.src = s; // fallback preload
+  });
 }
 renderFrameImg.src = pdSrcs[0];
 
@@ -893,12 +900,20 @@ async function exportMOV() {
 
   // Frames rendered — hold the bar full while we upload + encode.
   setRenderedFrames(totalFrames);
-  await new Promise(r => setTimeout(r, 0));
+  
+  // Resume the main canvas idle animation so the card doesn't look frozen!
+  syncCanvasSize(false);
+  startLoop();
+
+  await new Promise(r => setTimeout(r, 10));
 
   const BATCH = 25;
   const sessionId = Date.now().toString();
 
   for (let i = 0; i < frames.length; i += BATCH) {
+    // Yield to the UI before a heavy JSON stringify + fetch
+    await new Promise(r => setTimeout(r, 10));
+    
     const batch = frames.slice(i, i + BATCH);
     const res = await fetch('/render', {
       method: 'POST',
