@@ -36,6 +36,14 @@ sessions_lock = threading.Lock()
 
 
 class Handler(SimpleHTTPRequestHandler):
+    # Serve WebAssembly with the correct MIME so the browser can instantiate the
+    # in-browser ffmpeg encoder.
+    extensions_map = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        '.wasm': 'application/wasm',
+        '.js': 'text/javascript',
+    }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(DIR), **kwargs)
 

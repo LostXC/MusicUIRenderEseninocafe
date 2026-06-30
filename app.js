@@ -920,106 +920,154 @@ function hideRenderStatus() {
   renderStatus.hidden = true;
 }
 
-async function exportMOV() {
-  const introDur = state.useAnim ? CFG.contentEnd : 0;
-  const totalMs = introDur + CFG.idleDuration;
-  const totalFrames = Math.ceil((totalMs / 1000) * CFG.fps);
-  const frameDt = 1000 / CFG.fps;
+// ── In-browser encoder (ffmpeg.wasm) ────────────────────────────────────────
+// The whole render + encode runs on the visitor's machine: no frames are
+// uploaded and the server never touches ffmpeg. The ~32MB core is self-hosted
+// (same origin) and preloaded in the background so it's ready by Download time.
+// If it can't load (old browser, etc.) we fall back to the server pipeline.
+let ffmpegInstance = null;
+let ffmpegLoadPromise = null;
+
+function getFFmpeg() {
+  if (ffmpegInstance) return Promise.resolve(ffmpegInstance);
+  if (ffmpegLoadPromise) return ffmpegLoadPromise;
+  ffmpegLoadPromise = (async () => {
+    if (!window.FFmpegWASM || !window.FFmpegWASM.FFmpeg) throw new Error('ffmpeg.wasm wrapper missing');
+    const ff = new window.FFmpegWASM.FFmpeg();
+    const O = location.origin;
+    await ff.load({
+      coreURL: O + '/assets/ffmpeg/ffmpeg-core.js',
+      wasmURL: O + '/assets/ffmpeg/ffmpeg-core.wasm',
+    });
+    ffmpegInstance = ff;
+    return ff;
+  })().catch(e => { ffmpegLoadPromise = null; throw e; });
+  return ffmpegLoadPromise;
+}
+
+// Start fetching/compiling the encoder right away so the first export is instant.
+if (window.FFmpegWASM) getFFmpeg().catch(() => {});
+
+// Encode entirely in the browser. Assumes the render status is already shown, the
+// idle loop is stopped, and the layout is locked. Throws on failure so the caller
+// can fall back to the server.
+async function exportViaWasm(ff, totalFrames, frameDt) {
+  const written = [];
+  try {
+    if (renderStatusTitle) renderStatusTitle.textContent = 'Rendering frames';
+    for (let f = 0; f < totalFrames; f++) {
+      const timeMs = f * frameDt;
+      const introMs = state.useAnim ? timeMs : Infinity;
+      render(introMs, timeMs / 1000, true);
+      const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+      if (!blob) throw new Error('frame capture failed');
+      const name = 'f_' + String(f).padStart(5, '0') + '.png';
+      await ff.writeFile(name, new Uint8Array(await blob.arrayBuffer()));
+      written.push(name);
+      setRenderTarget(f + 1);
+    }
+    lockLayout = false;
+    syncCanvasSize(false);
+    startLoop();                                   // resume the live preview during encode
+
+    if (renderStatusTitle) renderStatusTitle.textContent = 'Encoding video';
+    setRenderTarget(totalFrames);
+    await ff.exec(['-y', '-framerate', String(CFG.fps), '-i', 'f_%05d.png',
+                   '-c:v', 'qtrle', '-pix_fmt', 'argb', 'out.mov']);
+    written.push('out.mov');
+
+    const data = await ff.readFile('out.mov');     // Uint8Array
+    const blob = new Blob([data], { type: 'video/quicktime' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `music-ui-${state.title.replace(/\s+/g, '-').toLowerCase()}.mov`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+
+    completeRenderStatus();
+    await new Promise(r => setTimeout(r, 250));
+  } finally {
+    // Free MEMFS so repeated exports don't accumulate (and leftover frames from a
+    // longer prior run can't sneak into the next encode's sequence).
+    for (const n of written) { try { await ff.deleteFile(n); } catch (_) {} }
+  }
+}
+
+// Server fallback: render frames into memory, upload them in big binary batches
+// (concurrent, with retry), then have the server ffmpeg encode the .mov. Same
+// assumptions/contract as exportViaWasm.
+async function exportViaServer(totalFrames, frameDt) {
   const sessionId = Date.now().toString();
 
-  showRenderStatus(totalFrames);
-  stopLoop();
+  // Rendering is NEVER gated on the network: every frame renders straight into
+  // memory, so the bar always races through. Completed batches go on a queue that
+  // background workers upload concurrently, each batch retrying for resilience.
+  const BATCH = 60, CONC = 4;
+  const blobs = [];
+  const queue = [];
+  let producerDone = false, failed = null;
 
-  // The export layout never changes between frames (it depends on the text/state,
-  // not time), so compute it once and skip the per-frame re-measure.
-  currentLayout = computeLayout();
-  lockLayout = true;
-
-  // Frames are uploaded in a few BIG binary batches instead of one request per
-  // frame. On a small remote box (render.com, 512MB) the per-frame approach spent
-  // almost all its time in hundreds of HTTP round-trips; batching collapses ~480
-  // requests into ~8. Each batch is the raw PNGs concatenated with a 4-byte length
-  // prefix per frame; the server streams them straight to disk, so memory stays
-  // tiny. Batches upload while later frames keep rendering (overlap).
-  const BATCH = 60;                // frames per request (~one batch held at a time)
-  const MAX_BATCHES = 3;           // batch uploads in flight at once
-  const inflight = new Set();
-  let failed = null;
-  let batch = [], batchStart = 0;
-
-  const snapshot = () => new Promise(res => canvas.toBlob(res, 'image/png'));
-
-  const flushBatch = async () => {
-    if (!batch.length) return;
-    const start = batchStart;
-    const blobs = batch;
-    batch = [];
+  async function uploadStart(start) {
+    const group = blobs.slice(start, Math.min(start + BATCH, totalFrames));
     const parts = [];
-    for (const b of blobs) {
+    for (const b of group) {
       const hdr = new Uint8Array(4);
-      new DataView(hdr.buffer).setUint32(0, b.size, false);   // big-endian length
+      new DataView(hdr.buffer).setUint32(0, b.size, false);
       parts.push(hdr, b);
     }
     const body = new Blob(parts);
-    const task = (async () => {
+    for (let attempt = 0; ; attempt++) {
       try {
         const res = await fetch(`/frames?session=${sessionId}&start=${start}&total=${totalFrames}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body,
+          method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body,
         });
         if (!res.ok) throw new Error(await res.text());
+        return;
       } catch (e) {
-        failed = failed || e;
+        if (attempt >= 2) throw e;
+        await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
       }
-      inflight.delete(task);
-    })();
-    inflight.add(task);
-    if (inflight.size >= MAX_BATCHES) await Promise.race(inflight);
-  };
+    }
+  }
 
+  async function uploadWorker() {
+    while (!failed) {
+      if (queue.length === 0) {
+        if (producerDone) return;
+        await new Promise(r => setTimeout(r, 15));
+        continue;
+      }
+      try { await uploadStart(queue.shift()); }
+      catch (e) { failed = failed || e; }
+    }
+  }
+  const workers = Array.from({ length: CONC }, uploadWorker);
+
+  if (renderStatusTitle) renderStatusTitle.textContent = 'Rendering frames';
   for (let f = 0; f < totalFrames && !failed; f++) {
     const timeMs = f * frameDt;
     const introMs = state.useAnim ? timeMs : Infinity;
     render(introMs, timeMs / 1000, true);
-    const blob = await snapshot();   // capture before the next render overwrites the canvas
+    const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
     if (!blob) { failed = new Error('frame capture failed'); break; }
-    if (!batch.length) batchStart = f;
-    batch.push(blob);
-    setRenderTarget(f + 1);          // bar tracks frames rendered → smooth, per-frame
-    if (batch.length >= BATCH) await flushBatch();
+    blobs.push(blob);
+    setRenderTarget(f + 1);
+    if ((f + 1) % BATCH === 0) queue.push(f + 1 - BATCH);
   }
-  if (!failed) await flushBatch();   // final partial batch
+  if (!failed && totalFrames % BATCH !== 0) queue.push(totalFrames - (totalFrames % BATCH));
+  producerDone = true;
   lockLayout = false;
-  await Promise.allSettled(inflight);
 
-  if (failed) {
-    alert('Render upload failed: ' + failed.message);
-    hideRenderStatus();
-    syncCanvasSize(false);
-    startLoop();
-    return;
-  }
-
-  // Every frame is on the server — trigger the (fast) encode and download the .mov.
+  syncCanvasSize(false);
+  startLoop();
   if (renderStatusTitle) renderStatusTitle.textContent = 'Encoding video';
+  setRenderTarget(totalFrames);
 
-  let res;
-  try {
-    res = await fetch(`/finalize?session=${sessionId}&fps=${CFG.fps}&total=${totalFrames}`, {
-      method: 'POST',
-    });
-  } catch (e) {
-    alert('Encode request failed: ' + e.message);
-    hideRenderStatus(); syncCanvasSize(false); startLoop();
-    return;
-  }
+  await Promise.all(workers);
+  if (failed) throw failed;
 
-  if (!res.ok) {
-    alert('Server error: ' + (await res.text()));
-    hideRenderStatus(); syncCanvasSize(false); startLoop();
-    return;
-  }
+  const res = await fetch(`/finalize?session=${sessionId}&fps=${CFG.fps}&total=${totalFrames}`, { method: 'POST' });
+  if (!res.ok) throw new Error(await res.text());
 
   const blob = await res.blob();
   const a = document.createElement('a');
@@ -1028,11 +1076,52 @@ async function exportMOV() {
   a.click();
   URL.revokeObjectURL(a.href);
 
-  completeRenderStatus();                       // fill the bar to 100%
-  await new Promise(r => setTimeout(r, 250));   // brief "done" hold
-  hideRenderStatus();
-  syncCanvasSize(false);
-  startLoop();
+  completeRenderStatus();
+  await new Promise(r => setTimeout(r, 250));
+}
+
+let exportInProgress = false;
+
+async function exportMOV() {
+  if (exportInProgress) return;
+  exportInProgress = true;
+
+  const introDur = state.useAnim ? CFG.contentEnd : 0;
+  const frameDt = 1000 / CFG.fps;
+  const totalFrames = Math.ceil(((introDur + CFG.idleDuration) / 1000) * CFG.fps);
+
+  showRenderStatus(totalFrames);
+  stopLoop();
+  currentLayout = computeLayout();     // layout is constant across export frames
+  lockLayout = true;
+
+  try {
+    // Prefer the in-browser encoder; wait for it to be ready (usually preloaded).
+    let ff = null;
+    if (window.FFmpegWASM) {
+      if (!ffmpegInstance && renderStatusTitle) renderStatusTitle.textContent = 'Preparing encoder…';
+      try { ff = await getFFmpeg(); } catch (_) { ff = null; }
+    }
+
+    if (ff) {
+      try { await exportViaWasm(ff, totalFrames, frameDt); return; }
+      catch (e) { console.warn('In-browser encode failed; falling back to server.', e); }
+      // The wasm path may have released the lock / resumed the loop — re-arm.
+      stopLoop();
+      currentLayout = computeLayout();
+      lockLayout = true;
+    }
+
+    await exportViaServer(totalFrames, frameDt);
+  } catch (e) {
+    alert('Export failed: ' + (e && e.message || e));
+  } finally {
+    lockLayout = false;
+    hideRenderStatus();
+    syncCanvasSize(false);
+    startLoop();
+    exportInProgress = false;
+  }
 }
 
 // ══════════════════════════════════
