@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -40,8 +41,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        if path == '/frame':
-            self._handle_frame()
+        if path == '/frames':
+            self._handle_frames()
         elif path == '/finalize':
             self._handle_finalize()
         elif path == '/spotify-info':
@@ -122,15 +123,18 @@ class Handler(SimpleHTTPRequestHandler):
     # Render / FFmpeg export endpoint
     # ------------------------------------------------------------------
 
-    def _handle_frame(self):
-        """Receive ONE frame as raw PNG bytes and save it. Stateless and
-        thread-safe, so the client can fire many uploads in parallel."""
+    def _handle_frames(self):
+        """Receive a BATCH of frames in one request: the body is repeated
+        [uint32 big-endian length][PNG bytes], numbered sequentially from &start.
+        Batching collapses hundreds of per-frame round-trips into a handful of
+        requests. Frames are written straight to disk, so peak memory is ~one
+        batch — important on a 512MB instance."""
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         session_id = q.get('session', [''])[0]
-        index = int(q.get('index', ['0'])[0])
+        start = int(q.get('start', ['0'])[0])
 
         content_len = int(self.headers.get('Content-Length', 0))
-        png_bytes = self.rfile.read(content_len)
+        body = self.rfile.read(content_len)
 
         if not session_id:
             self.send_error(400, "Missing session")
@@ -143,9 +147,16 @@ class Handler(SimpleHTTPRequestHandler):
                 tmp = tempfile.mkdtemp(prefix='musicui_')
                 sessions[session_id] = tmp
 
-        frame_path = os.path.join(tmp, f'frame_{index:04d}.png')
-        with open(frame_path, 'wb') as f:
-            f.write(png_bytes)
+        # Parse the length-prefixed frames and write each to disk.
+        off, i, n = 0, 0, len(body)
+        while off + 4 <= n:
+            (ln,) = struct.unpack_from('>I', body, off)
+            off += 4
+            png = body[off:off + ln]
+            off += ln
+            with open(os.path.join(tmp, f'frame_{start + i:04d}.png'), 'wb') as f:
+                f.write(png)
+            i += 1
 
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain')

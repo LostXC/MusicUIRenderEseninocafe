@@ -86,6 +86,7 @@ let clockIconImg = null;
 
 let containerW = 504;
 let currentLayout = null;
+let lockLayout = false;   // during export the layout is constant — compute it once
 let loopId = null;
 let loopStart = null;
 let introActive = false;
@@ -510,7 +511,7 @@ function computeLayout() {
 }
 
 function syncCanvasSize(isExporting = false) {
-  currentLayout = computeLayout();
+  if (!(lockLayout && currentLayout)) currentLayout = computeLayout();
   const S = isExporting ? CFG.exportScale : CFG.uiScale;
   const w = Math.ceil(currentLayout.overallW);
   const h = Math.ceil(currentLayout.contentBottom);
@@ -929,16 +930,53 @@ async function exportMOV() {
   showRenderStatus(totalFrames);
   stopLoop();
 
-  // Pipeline: render each frame, snapshot it as a binary PNG, and upload it while
-  // the next frames keep rendering. Transfer overlaps rendering (instead of running
-  // entirely after it), and several uploads fly at once. The ffmpeg encode is the
-  // fast part (<1s); the old bottleneck was ~20 sequential base64 batch round-trips.
-  const MAX_INFLIGHT = 6;          // concurrent uploads (also caps blobs held in memory)
+  // The export layout never changes between frames (it depends on the text/state,
+  // not time), so compute it once and skip the per-frame re-measure.
+  currentLayout = computeLayout();
+  lockLayout = true;
+
+  // Frames are uploaded in a few BIG binary batches instead of one request per
+  // frame. On a small remote box (render.com, 512MB) the per-frame approach spent
+  // almost all its time in hundreds of HTTP round-trips; batching collapses ~480
+  // requests into ~8. Each batch is the raw PNGs concatenated with a 4-byte length
+  // prefix per frame; the server streams them straight to disk, so memory stays
+  // tiny. Batches upload while later frames keep rendering (overlap).
+  const BATCH = 60;                // frames per request (~one batch held at a time)
+  const MAX_BATCHES = 3;           // batch uploads in flight at once
   const inflight = new Set();
-  let uploaded = 0;
   let failed = null;
+  let batch = [], batchStart = 0;
 
   const snapshot = () => new Promise(res => canvas.toBlob(res, 'image/png'));
+
+  const flushBatch = async () => {
+    if (!batch.length) return;
+    const start = batchStart;
+    const blobs = batch;
+    batch = [];
+    const parts = [];
+    for (const b of blobs) {
+      const hdr = new Uint8Array(4);
+      new DataView(hdr.buffer).setUint32(0, b.size, false);   // big-endian length
+      parts.push(hdr, b);
+    }
+    const body = new Blob(parts);
+    const task = (async () => {
+      try {
+        const res = await fetch(`/frames?session=${sessionId}&start=${start}&total=${totalFrames}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body,
+        });
+        if (!res.ok) throw new Error(await res.text());
+      } catch (e) {
+        failed = failed || e;
+      }
+      inflight.delete(task);
+    })();
+    inflight.add(task);
+    if (inflight.size >= MAX_BATCHES) await Promise.race(inflight);
+  };
 
   for (let f = 0; f < totalFrames && !failed; f++) {
     const timeMs = f * frameDt;
@@ -946,27 +984,13 @@ async function exportMOV() {
     render(introMs, timeMs / 1000, true);
     const blob = await snapshot();   // capture before the next render overwrites the canvas
     if (!blob) { failed = new Error('frame capture failed'); break; }
-
-    const task = (async () => {
-      try {
-        const res = await fetch(`/frame?session=${sessionId}&index=${f}&total=${totalFrames}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'image/png' },
-          body: blob,
-        });
-        if (!res.ok) throw new Error(await res.text());
-        uploaded++;
-        setRenderTarget(uploaded);
-      } catch (e) {
-        failed = failed || e;
-      }
-      inflight.delete(task);
-    })();
-    inflight.add(task);
-
-    if (inflight.size >= MAX_INFLIGHT) await Promise.race(inflight);
+    if (!batch.length) batchStart = f;
+    batch.push(blob);
+    setRenderTarget(f + 1);          // bar tracks frames rendered → smooth, per-frame
+    if (batch.length >= BATCH) await flushBatch();
   }
-
+  if (!failed) await flushBatch();   // final partial batch
+  lockLayout = false;
   await Promise.allSettled(inflight);
 
   if (failed) {
@@ -979,7 +1003,6 @@ async function exportMOV() {
 
   // Every frame is on the server — trigger the (fast) encode and download the .mov.
   if (renderStatusTitle) renderStatusTitle.textContent = 'Encoding video';
-  setRenderTarget(totalFrames);
 
   let res;
   try {
